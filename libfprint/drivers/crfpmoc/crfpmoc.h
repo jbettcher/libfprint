@@ -46,6 +46,8 @@ G_DECLARE_FINAL_TYPE (FpiDeviceCrfpMoc, fpi_device_crfpmoc, FPI, DEVICE_CRFPMOC,
 #define CRFPMOC_EC_CMD_FP_MODE 0x0402
 #define CRFPMOC_EC_CMD_FP_INFO 0x0403
 #define CRFPMOC_EC_CMD_FP_STATS 0x0407
+/* Query which versions of a host command the EC supports */
+#define CRFPMOC_EC_CMD_GET_CMD_VERSIONS 0x0008
 #define CRFPMOC_EC_CMD_FP_SEED 0x0408
 
 /* Put the sensor in its lowest power mode */
@@ -241,6 +243,66 @@ struct crfpmoc_ec_response_fp_info
   guint32 template_dirty;   /* bitmap of templates with MCU side changes */
   guint32 template_version; /* version of the template format */
 } __attribute__((packed));
+
+/* EC_CMD_GET_CMD_VERSIONS v1: 16-bit command id */
+struct crfpmoc_ec_params_get_cmd_versions_v1
+{
+  guint16 cmd;
+} __attribute__((packed));
+
+struct crfpmoc_ec_response_get_cmd_versions
+{
+  guint32 version_mask;
+} __attribute__((packed));
+
+/* EC_CMD_FP_INFO v3. Newer FPMCU firmware (2025+) only accepts this version.
+ * The response has a fixed size: header plus CRFPMOC_FP_MAX_CAPTURE_TYPES
+ * image frame descriptors (unused entries are zeroed).
+ */
+#define CRFPMOC_FP_MAX_CAPTURE_TYPES 10
+
+struct crfpmoc_fp_sensor_info
+{
+  guint32 vendor_id;
+  guint32 product_id;
+  guint32 model_id;
+  guint32 version;
+  guint16 num_capture_types;
+  guint16 errors;
+} __attribute__((packed));
+
+struct crfpmoc_fp_template_info
+{
+  guint32 template_size;    /* max template size in bytes */
+  guint16 template_max;     /* maximum number of fingers/templates */
+  guint16 template_valid;   /* number of valid fingers/templates */
+  guint32 template_dirty;   /* bitmap of templates with MCU side changes */
+  guint32 template_version; /* version of the template format */
+} __attribute__((packed));
+
+struct crfpmoc_fp_image_frame_params_v2
+{
+  guint32 frame_size;
+  guint32 image_data_offset_bytes;
+  guint32 pixel_format;
+  guint16 width;
+  guint16 height;
+  guint16 bpp;
+  guint8  fp_capture_type;
+  guint8  reserved;
+} __attribute__((packed));
+
+struct crfpmoc_ec_response_fp_info_v3
+{
+  struct crfpmoc_fp_sensor_info           sensor_info;
+  struct crfpmoc_fp_template_info         template_info;
+  struct crfpmoc_fp_image_frame_params_v2 image_frame_params[CRFPMOC_FP_MAX_CAPTURE_TYPES];
+} __attribute__((packed));
+
+G_STATIC_ASSERT (sizeof (struct crfpmoc_fp_sensor_info) == 20);
+G_STATIC_ASSERT (sizeof (struct crfpmoc_fp_template_info) == 16);
+G_STATIC_ASSERT (sizeof (struct crfpmoc_fp_image_frame_params_v2) == 20);
+G_STATIC_ASSERT (sizeof (struct crfpmoc_ec_response_fp_info_v3) == 36 + 10 * 20);
 
 /* Note: used in crfpmoc_ec_response_get_next_data_v1 */
 struct crfpmoc_ec_response_motion_sense_fifo_info
@@ -446,8 +508,9 @@ enum crfpmoc_ec_status {
 /* Open state machine states
  */
 enum {
-  OPEN_GET_PROTO_INFO, /* Query protocol info (max in/out sizes) */
-  OPEN_GET_FP_INFO,    /* Query fingerprint sensor info */
+  OPEN_GET_PROTO_INFO,      /* Query protocol info (max in/out sizes) */
+  OPEN_GET_FP_INFO_VERSION, /* Query supported EC_CMD_FP_INFO versions */
+  OPEN_GET_FP_INFO,         /* Query fingerprint sensor info */
   OPEN_STATES,
 };
 

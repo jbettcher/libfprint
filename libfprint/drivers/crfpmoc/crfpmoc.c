@@ -38,6 +38,7 @@ struct _FpiDeviceCrfpMoc
   guint16  max_outsize;
   guint16  max_templates;
   guint16  template_size;
+  guint8   fp_info_version; /* EC_CMD_FP_INFO version to use: 1 or 3 */
 
   guint8   seed[CRFPMOC_FP_CONTEXT_TPM_BYTES];
   guint8   context[CRFPMOC_FP_CONTEXT_USERID_BYTES];
@@ -733,6 +734,55 @@ crfpmoc_clear_storage_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoint
     }
 }
 
+/* Build an EC_CMD_FP_INFO request using the version the firmware supports.
+ * Older FPMCU firmware only accepts v1; newer firmware only accepts v3.
+ */
+static CrfpMocEcTransfer *
+crfpmoc_fp_info_transfer_new (FpDevice *device)
+{
+  FpiDeviceCrfpMoc *self = FPI_DEVICE_CRFPMOC (device);
+
+  if (self->fp_info_version == 3)
+    return crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_INFO, 3, NULL, 0,
+                                        sizeof (struct crfpmoc_ec_response_fp_info_v3));
+
+  return crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_INFO, 1, NULL, 0,
+                                      sizeof (struct crfpmoc_ec_response_fp_info));
+}
+
+/* Normalize an EC_CMD_FP_INFO response (v1 or v3) into the v1 layout. */
+static void
+crfpmoc_fp_info_from_transfer (CrfpMocEcTransfer                  *transfer,
+                               struct crfpmoc_ec_response_fp_info *out)
+{
+  memset (out, 0, sizeof (*out));
+
+  if (transfer->version == 3)
+    {
+      const struct crfpmoc_ec_response_fp_info_v3 *v3 = transfer->indata;
+      const struct crfpmoc_fp_image_frame_params_v2 *frame = &v3->image_frame_params[0];
+
+      out->vendor_id = v3->sensor_info.vendor_id;
+      out->product_id = v3->sensor_info.product_id;
+      out->model_id = v3->sensor_info.model_id;
+      out->version = v3->sensor_info.version;
+      out->errors = v3->sensor_info.errors;
+      out->frame_size = frame->frame_size;
+      out->pixel_format = frame->pixel_format;
+      out->width = frame->width;
+      out->height = frame->height;
+      out->bpp = frame->bpp;
+      out->template_size = v3->template_info.template_size;
+      out->template_max = v3->template_info.template_max;
+      out->template_valid = v3->template_info.template_valid;
+      out->template_dirty = v3->template_info.template_dirty;
+      out->template_version = v3->template_info.template_version;
+      return;
+    }
+
+  memcpy (out, transfer->indata, sizeof (*out));
+}
+
 /* Parse the device info response, vendor, version, etc. Get the state
  * of the loaded templates and how many can be loaded as well as the
  * size of templates. All templates have the same size on a given device.
@@ -960,13 +1010,50 @@ crfpmoc_open_proto_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoi
 }
 
 static void
+crfpmoc_open_fp_info_version_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointer user_data)
+{
+  g_autoptr(GError) error = NULL;
+  FpiSsm *ssm = user_data;
+  FpDevice *device = fpi_ssm_get_device (ssm);
+  FpiDeviceCrfpMoc *self = FPI_DEVICE_CRFPMOC (device);
+  guint32 mask;
+
+  if (!crfpmoc_ec_transfer_submit_finish (res, &error))
+    {
+      /* Very old firmware: keep the historical v1 behaviour */
+      fp_dbg ("Failed to query FP_INFO versions, assuming v1: %s", error->message);
+      self->fp_info_version = 1;
+      fpi_ssm_next_state (ssm);
+      return;
+    }
+
+  mask = ((struct crfpmoc_ec_response_get_cmd_versions *) transfer->indata)->version_mask;
+  fp_dbg ("FP_INFO supported versions mask: 0x%x", mask);
+
+  if (mask & (1u << 3))
+    self->fp_info_version = 3;
+  else if (mask & (1u << 1))
+    self->fp_info_version = 1;
+  else
+    {
+      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
+                                                          "Unsupported FP_INFO versions (mask 0x%x)",
+                                                          mask));
+      return;
+    }
+
+  fpi_ssm_next_state (ssm);
+}
+
+static void
 crfpmoc_open_fp_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointer user_data)
 {
   g_autoptr(GError) error = NULL;
   FpiSsm *ssm = user_data;
   FpDevice *device = fpi_ssm_get_device (ssm);
   FpiDeviceCrfpMoc *self = FPI_DEVICE_CRFPMOC (device);
-  struct crfpmoc_ec_response_fp_info *info;
+  struct crfpmoc_ec_response_fp_info info_buf;
+  struct crfpmoc_ec_response_fp_info *info = &info_buf;
 
   if (!crfpmoc_ec_transfer_submit_finish (res, &error))
     {
@@ -975,7 +1062,7 @@ crfpmoc_open_fp_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointe
       return;
     }
 
-  info = (struct crfpmoc_ec_response_fp_info *) transfer->indata;
+  crfpmoc_fp_info_from_transfer (transfer, info);
 
   if (!crfpmoc_parse_fp_info (info, &self->max_templates,
                               &self->template_size, &error))
@@ -1002,9 +1089,20 @@ crfpmoc_open_run_state (FpiSsm *ssm, FpDevice *device)
                                       crfpmoc_open_proto_info_cb, ssm);
       break;
 
+    case OPEN_GET_FP_INFO_VERSION:
+      {
+        struct crfpmoc_ec_params_get_cmd_versions_v1 p = { .cmd = CRFPMOC_EC_CMD_FP_INFO };
+
+        transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_GET_CMD_VERSIONS, 1,
+                                                &p, sizeof (p),
+                                                sizeof (struct crfpmoc_ec_response_get_cmd_versions));
+        crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
+                                        crfpmoc_open_fp_info_version_cb, ssm);
+      }
+      break;
+
     case OPEN_GET_FP_INFO:
-      transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_INFO, 1,
-                                              NULL, 0, sizeof (struct crfpmoc_ec_response_fp_info));
+      transfer = crfpmoc_fp_info_transfer_new (device);
       crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
                                       crfpmoc_open_fp_info_cb, ssm);
       break;
@@ -1160,7 +1258,8 @@ crfpmoc_commit_fp_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoin
   FpiDeviceCrfpMoc *self = FPI_DEVICE_CRFPMOC (device);
   DownloadData *ddata;
   FpiSsm *sub;
-  struct crfpmoc_ec_response_fp_info *info;
+  struct crfpmoc_ec_response_fp_info info_buf;
+  struct crfpmoc_ec_response_fp_info *info = &info_buf;
   guint16 enrolled_templates;
 
   if (!crfpmoc_ec_transfer_submit_finish (res, &error))
@@ -1171,7 +1270,7 @@ crfpmoc_commit_fp_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoin
       return;
     }
 
-  info = (struct crfpmoc_ec_response_fp_info *) transfer->indata;
+  crfpmoc_fp_info_from_transfer (transfer, info);
   enrolled_templates = info->template_valid;
   fp_dbg ("Number of enrolled templates is: %d", enrolled_templates);
 
@@ -1203,7 +1302,8 @@ crfpmoc_verify_fp_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoin
   CrfpMocEcTransfer *stats_transfer;
   FpiSsm *ssm = user_data;
   FpDevice *device = fpi_ssm_get_device (ssm);
-  struct crfpmoc_ec_response_fp_info *info;
+  struct crfpmoc_ec_response_fp_info info_buf;
+  struct crfpmoc_ec_response_fp_info *info = &info_buf;
   guint16 enrolled_templates;
 
   if (!crfpmoc_ec_transfer_submit_finish (res, &error))
@@ -1212,7 +1312,7 @@ crfpmoc_verify_fp_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoin
       return;
     }
 
-  info = (struct crfpmoc_ec_response_fp_info *) transfer->indata;
+  crfpmoc_fp_info_from_transfer (transfer, info);
   enrolled_templates = info->template_valid;
 
   fp_dbg ("handle_verify_check: enrolled templates: %d", enrolled_templates);
@@ -1422,8 +1522,7 @@ handle_enroll_commit (FpiSsm *ssm)
   FpDevice *device = fpi_ssm_get_device (ssm);
   CrfpMocEcTransfer *transfer;
 
-  transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_INFO, 1,
-                                          NULL, 0, sizeof (struct crfpmoc_ec_response_fp_info));
+  transfer = crfpmoc_fp_info_transfer_new (device);
   crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
                                   crfpmoc_commit_fp_info_cb, ssm);
 }
@@ -1433,7 +1532,8 @@ crfpmoc_enroll_capacity_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoi
 {
   g_autoptr(GError) error = NULL;
   FpiSsm *ssm = user_data;
-  struct crfpmoc_ec_response_fp_info *info;
+  struct crfpmoc_ec_response_fp_info info_buf;
+  struct crfpmoc_ec_response_fp_info *info = &info_buf;
 
   if (!crfpmoc_ec_transfer_submit_finish (res, &error))
     {
@@ -1441,7 +1541,7 @@ crfpmoc_enroll_capacity_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoi
       return;
     }
 
-  info = (struct crfpmoc_ec_response_fp_info *) transfer->indata;
+  crfpmoc_fp_info_from_transfer (transfer, info);
   fp_dbg ("handle_enroll_check_capacity: enrolled %d of %d templates",
           info->template_valid, info->template_max);
 
@@ -1465,8 +1565,7 @@ handle_enroll_check_capacity (FpiSsm *ssm)
   FpDevice *device = fpi_ssm_get_device (ssm);
   CrfpMocEcTransfer *transfer;
 
-  transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_INFO, 1,
-                                          NULL, 0, sizeof (struct crfpmoc_ec_response_fp_info));
+  transfer = crfpmoc_fp_info_transfer_new (device);
   crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
                                   crfpmoc_enroll_capacity_cb, ssm);
 }
@@ -1714,8 +1813,7 @@ handle_verify_check (FpiSsm *ssm)
   FpDevice *device = fpi_ssm_get_device (ssm);
   CrfpMocEcTransfer *transfer;
 
-  transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_INFO, 1,
-                                          NULL, 0, sizeof (struct crfpmoc_ec_response_fp_info));
+  transfer = crfpmoc_fp_info_transfer_new (device);
   crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
                                   crfpmoc_verify_fp_info_cb, ssm);
 }
@@ -2333,6 +2431,7 @@ static void
 fpi_device_crfpmoc_init (FpiDeviceCrfpMoc *self)
 {
   self->emul_fd = -1;
+  self->fp_info_version = 1;
 }
 
 /* Register the device. Note, this function is declared in the
