@@ -23,6 +23,9 @@
 
 #define FP_COMPONENT "crfpmoc"
 
+#include <errno.h>
+#include <string.h>
+#include <sys/random.h>
 #include <glib-unix.h>
 #include <gio/gunixinputstream.h>
 
@@ -1130,6 +1133,71 @@ crfpmoc_open_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
  * mode fixed test values are used so the recorded ioctl replay stays
  * deterministic; on real hardware random values are generated.
  */
+/* The FPMCU derives the template encryption key from the seed, the user
+ * context and a secret that never leaves the MCU. The seed and context must
+ * therefore stay the same across reboots, or prints enrolled earlier can no
+ * longer be decrypted (FP_TEMPLATE upload fails with EC_RES_UNAVAILABLE).
+ * ChromeOS keeps the seed sealed in the TPM; here it is generated once and
+ * kept in fprintd's root-only state directory. On its own it is useless
+ * without the MCU-internal secret.
+ */
+#define CRFPMOC_KEYS_FILE "/var/lib/fprint/.crfpmoc-keys"
+
+static void
+crfpmoc_load_or_create_keys (FpiDeviceCrfpMoc *self)
+{
+  const gsize keys_len = sizeof (self->seed) + sizeof (self->context);
+  g_autoptr(GError) error = NULL;
+  g_autofree gchar *contents = NULL;
+  guint8 buf[sizeof (self->seed) + sizeof (self->context)];
+  gsize len = 0;
+  gsize got = 0;
+
+  if (g_file_get_contents (CRFPMOC_KEYS_FILE, &contents, &len, &error))
+    {
+      if (len == keys_len)
+        {
+          memcpy (self->seed, contents, sizeof (self->seed));
+          memcpy (self->context, contents + sizeof (self->seed), sizeof (self->context));
+          explicit_bzero (contents, len);
+          fp_dbg ("Loaded persistent keys from %s", CRFPMOC_KEYS_FILE);
+          return;
+        }
+      g_warning ("Ignoring %s with unexpected size %" G_GSIZE_FORMAT, CRFPMOC_KEYS_FILE, len);
+      explicit_bzero (contents, len);
+    }
+  else if (!g_error_matches (error, G_FILE_ERROR, G_FILE_ERROR_NOENT))
+    {
+      g_warning ("Failed to read %s: %s", CRFPMOC_KEYS_FILE, error->message);
+    }
+  g_clear_error (&error);
+
+  while (got < keys_len)
+    {
+      gssize r = getrandom (buf + got, keys_len - got, 0);
+
+      if (r < 0)
+        {
+          if (errno == EINTR)
+            continue;
+          g_error ("getrandom failed: %s", g_strerror (errno));
+        }
+      got += r;
+    }
+
+  memcpy (self->seed, buf, sizeof (self->seed));
+  memcpy (self->context, buf + sizeof (self->seed), sizeof (self->context));
+
+  if (!g_file_set_contents_full (CRFPMOC_KEYS_FILE, (const gchar *) buf, keys_len,
+                                 G_FILE_SET_CONTENTS_CONSISTENT, 0600, &error))
+    g_warning ("Failed to store keys in %s, prints will not survive a reboot: %s",
+               CRFPMOC_KEYS_FILE, error->message);
+  else
+    fp_dbg ("Created persistent keys in %s", CRFPMOC_KEYS_FILE);
+
+  explicit_bzero (buf, sizeof (buf));
+}
+
 static void
 crfpmoc_init_keys (FpiDeviceCrfpMoc *self)
 {
@@ -1145,11 +1213,7 @@ crfpmoc_init_keys (FpiDeviceCrfpMoc *self)
     }
   else
     {
-      for (size_t i = 0; i < sizeof (self->seed); i++)
-        self->seed[i] = (guint8) g_random_int_range (0, 256);
-
-      for (size_t i = 0; i < sizeof (self->context); i++)
-        self->context[i] = (guint8) g_random_int_range (0, 256);
+      crfpmoc_load_or_create_keys (self);
     }
 }
 
