@@ -404,7 +404,7 @@ crfpmoc_umockdev_record (FpiDeviceCrfpMoc *self, int res,
  * to see if a timeout is active.
  */
 static gboolean
-crfpmoc_read_bytes (gpointer user_data)
+crfpmoc_read_bytes (GObject *pollable_stream, gpointer user_data)
 {
   g_autoptr(GError) error = NULL;
   FpiSsm *ssm = user_data;
@@ -594,8 +594,11 @@ crfpmoc_eventmask_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointer u
   GSource *poll_source = g_pollable_input_stream_create_source (
     G_POLLABLE_INPUT_STREAM (data->poll_input_stream),
     fpi_device_get_cancellable (device));
-  g_source_set_callback (poll_source, crfpmoc_read_bytes, ssm, NULL);
+  /* Pollable stream sources dispatch a GPollableSourceFunc
+   * (stream, user_data), not a plain GSourceFunc (user_data). */
+  g_source_set_callback (poll_source, G_SOURCE_FUNC (crfpmoc_read_bytes), ssm, NULL);
   data->poll_source = g_source_attach (poll_source, NULL);
+  g_source_unref (poll_source);
 }
 
 /* Enable device event reporting and queue a callback when there is
