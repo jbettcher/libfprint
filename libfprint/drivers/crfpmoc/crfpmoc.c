@@ -724,7 +724,7 @@ crfpmoc_clear_storage_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoint
       data->clear_step = 1;
       p.mode = CRFPMOC_FP_MODE_RESET_SENSOR;
       new_transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_MODE, 0,
-                                                  &p, sizeof (p), 0);
+                                                  &p, sizeof (p), sizeof (struct crfpmoc_ec_response_fp_mode));
       crfpmoc_ec_transfer_submit_cmd (new_transfer, fpi_device_get_cancellable (device),
                                       crfpmoc_clear_storage_cb, ssm);
     }
@@ -1439,7 +1439,7 @@ handle_enroll_reset (FpiSsm *ssm)
   CrfpMocEcTransfer *transfer;
 
   transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_MODE, 0,
-                                          &p, sizeof (p), 0);
+                                          &p, sizeof (p), sizeof (struct crfpmoc_ec_response_fp_mode));
   crfpmoc_ec_transfer_submit_cmd (transfer, NULL, crfpmoc_ssm_ec_transfer_cb, ssm);
 }
 
@@ -1710,7 +1710,7 @@ handle_verify_reset (FpiSsm *ssm)
   CrfpMocEcTransfer *transfer;
 
   transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_MODE, 0,
-                                          &p, sizeof (p), 0);
+                                          &p, sizeof (p), sizeof (struct crfpmoc_ec_response_fp_mode));
   crfpmoc_ec_transfer_submit_cmd (transfer, NULL, crfpmoc_ssm_ec_transfer_cb, ssm);
 }
 
@@ -1939,7 +1939,7 @@ crfpmoc_clear_storage_run_state (FpiSsm *ssm, FpDevice *device)
       data->clear_step = 0;
 
       transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_MODE, 0,
-                                              &p, sizeof (p), 0);
+                                              &p, sizeof (p), sizeof (struct crfpmoc_ec_response_fp_mode));
       crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
                                       crfpmoc_clear_storage_cb, ssm);
       break;
